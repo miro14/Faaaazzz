@@ -1,0 +1,112 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble project from flat files
+        run: |
+          set -e
+          for f in build.gradle settings.gradle gradle.properties app-build.gradle release.keystore AndroidManifest.xml MainActivity.java index.html ic_launcher.png; do
+            [ -f "$f" ] || { echo "::error::الملف المطلوب غير موجود في المستودع: $f"; exit 1; }
+          done
+          mkdir -p android/app/src/main/java/app/filereader android/app/src/main/assets android/app/src/main/res/mipmap-xxxhdpi
+          cp build.gradle settings.gradle gradle.properties android/
+          cp app-build.gradle android/app/build.gradle
+          cp release.keystore android/app/
+          cp AndroidManifest.xml android/app/src/main/
+          cp MainActivity.java android/app/src/main/java/app/filereader/
+          cp index.html android/app/src/main/assets/
+          cp ic_launcher.png android/app/src/main/res/mipmap-xxxhdpi/
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download offline libraries (PDF, Word, Excel, OCR, fonts)
+        shell: bash
+        run: |
+          set -uo pipefail
+          A="$GITHUB_WORKSPACE/android/app/src/main/assets"
+          mkdir -p "$A/lib/pdfjs" "$A/lib/tesseract/core" "$A/lib/tessdata" "$A/lib/fonts/files"
+          WARN=0
+          try() { "$@" || { echo "::warning::فشل: $*"; WARN=1; }; }
+
+          mkdir -p /tmp/npm && cd /tmp/npm && npm init -y > /dev/null
+          for P in pdfjs-dist@3.11.174 tesseract.js@5.1.1 mammoth@1.6.0 xlsx@0.18.5 \
+                   @tesseract.js-data/ara @tesseract.js-data/eng @tesseract.js-data/fra \
+                   @fontsource/ibm-plex-sans-arabic; do
+            try npm install --no-audit --no-fund "$P"
+          done
+          N=/tmp/npm/node_modules
+
+          try cp "$N/pdfjs-dist/build/pdf.min.js" "$N/pdfjs-dist/build/pdf.worker.min.js" "$A/lib/"
+          try cp -r "$N/pdfjs-dist/cmaps" "$N/pdfjs-dist/standard_fonts" "$A/lib/pdfjs/"
+          try cp "$N/mammoth/mammoth.browser.min.js" "$A/lib/"
+          try cp "$N/xlsx/dist/xlsx.full.min.js" "$A/lib/"
+          try cp "$N/tesseract.js/dist/tesseract.min.js" "$A/lib/"
+          try cp "$N/tesseract.js/dist/worker.min.js" "$A/lib/tesseract/"
+          for F in "$N"/tesseract.js-core/tesseract-core*; do try cp "$F" "$A/lib/tesseract/core/"; done
+
+          for L in ara eng fra; do
+            F=$(find "$N/@tesseract.js-data/$L" -name "$L.traineddata.gz" -path "*best_int*" 2>/dev/null | head -1)
+            [ -n "$F" ] || F=$(find "$N/@tesseract.js-data/$L" -name "$L.traineddata.gz" 2>/dev/null | head -1)
+            [ -n "$F" ] && try cp "$F" "$A/lib/tessdata/$L.traineddata.gz" || { echo "::warning::بيانات اللغة $L غير موجودة"; WARN=1; }
+          done
+
+          FS="$N/@fontsource/ibm-plex-sans-arabic"
+          : > "$A/lib/fonts/fonts.css"
+          for W in 400 500 600 700; do [ -f "$FS/$W.css" ] && cat "$FS/$W.css" >> "$A/lib/fonts/fonts.css" || { echo "::warning::خط $W غير موجود"; WARN=1; }; done
+          for W in 400 500 600 700; do for F in "$FS"/files/*-"$W"-normal.woff2; do [ -f "$F" ] && cp "$F" "$A/lib/fonts/files/"; done; done
+
+          echo "---- التحقق من ملفات العمل دون إنترنت ----"
+          cd "$A"
+          MISS=""
+          for f in lib/pdf.min.js lib/pdf.worker.min.js lib/mammoth.browser.min.js lib/xlsx.full.min.js \
+                   lib/tesseract.min.js lib/tesseract/worker.min.js lib/fonts/fonts.css \
+                   lib/tessdata/ara.traineddata.gz lib/tessdata/eng.traineddata.gz lib/tessdata/fra.traineddata.gz; do
+            [ -s "$f" ] || MISS="$MISS $f"
+          done
+          [ "$(ls lib/pdfjs/cmaps 2>/dev/null | wc -l)" -gt 10 ] || MISS="$MISS lib/pdfjs/cmaps"
+          [ "$(ls lib/pdfjs/standard_fonts 2>/dev/null | wc -l)" -gt 5 ] || MISS="$MISS lib/pdfjs/standard_fonts"
+          [ "$(ls lib/tesseract/core 2>/dev/null | wc -l)" -gt 1 ] || MISS="$MISS lib/tesseract/core"
+          [ "$(ls lib/fonts/files 2>/dev/null | wc -l)" -gt 3 ] || MISS="$MISS lib/fonts/files"
+          if [ -n "$MISS" ]; then echo "::warning::ملفات ناقصة (ستعمل الميزة المرتبطة بها بشكل محدود):$MISS"; else echo "كل الملفات موجودة ✓"; fi
+          du -sh lib || true; find lib -type f | wc -l
+          { echo "### المكتبات غير المتصلة"; if [ -n "$MISS" ]; then echo "ناقص:$MISS"; else echo "جميعها موجودة ✓"; fi; } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Prepare Android SDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+
+      - name: Build release APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Copy APK
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk FileReader.apk
+          ls -la FileReader.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FileReader-APK
+          path: FileReader.apk
+          if-no-files-found: error
